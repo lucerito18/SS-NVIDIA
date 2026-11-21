@@ -37,6 +37,11 @@ lenta, sino la suma de estas cosas:
    segundos; ahora se usa `pypdf` (10-50x más rápido) y pdfplumber queda como respaldo. Además,
    la instancia gratuita se apaga tras 15 minutos sin tráfico: la primera petición del día tarda
    ~50 s solo en despertar.
+7. **Un solo JSON mal formado detenía toda la corrida.** Los modelos abiertos devuelven a veces
+   comas finales, claves sin comillas, saltos de línea dentro de una cadena o el JSON cortado por
+   el tope de tokens. Antes eso lanzaba `JSONDecodeError`, el Jefe repetía el agente entero y, si
+   volvía a fallar, detenía el proceso. Ahora `parsear_json` repara esas variantes al vuelo, y el
+   Recopilador reintenta **solo el bloque** que falló, no todos.
 
 ### Variables para ajustar velocidad (todas opcionales)
 
@@ -110,6 +115,17 @@ Luego define `NVIDIA_MODEL` en Render y compara en los logs el tiempo de respues
   mucho la experiencia; también sirve un ping cada 10 minutos (UptimeRobot, cron-job.org).
 - **Muchas diapositivas con imagen**: cada imagen marcada cuesta búsqueda + descarga + verificación
   con visión. Baja `MAX_DIAPOSITIVAS` o pon `VERIFICAR_IMAGENES_IA=0`.
+
+### Si la corrida se detiene
+
+- **`JSONDecodeError` / "La IA no devolvió un JSON válido"**: ya no debería tumbar el proceso (se
+  repara el JSON). Si aun así aparece, el mensaje incluye la columna exacta del fallo; mira el log
+  `[JSON] Respuesta reparada` para confirmar que se recuperó.
+- **`HTTP 429`**: se alcanzó el límite del plan gratuito (~40 peticiones/minuto). Baja `HILOS_LOTES`
+  a `1` y `HILOS_IMAGENES` a `2`.
+- **`HTTP 402` o timeout en imágenes**: el modelo de visión o FLUX rechazó la petición. Pon
+  `VERIFICAR_IMAGENES_IA=0` y `MAX_IMAGENES_IA=0` para generar la presentación sin imágenes.
+- **Memoria agotada en Render Free (512 MB)**: baja `HILOS_IMAGENES` y `MAX_DIAPOSITIVAS`.
 
 ## Estructura
 

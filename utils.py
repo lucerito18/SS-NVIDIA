@@ -259,22 +259,204 @@ def llamar_llm(system_instruction, prompt, max_tokens=None):
             time.sleep(esperas[k])
 
 
+# ==============================================================================
+# JSON tolerante: los modelos abiertos devuelven "casi JSON"
+# ==============================================================================
+
+_COMILLAS_JSON = {'"': '"', "'": "'", "“": "”", "”": "”", "‘": "’", "’": "’", "«": "»", "»": "»"}
+
+_ESCAPES_JSON = {"b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t"}
+
+
+def _bloque_json(texto):
+    """Devuelve el trozo que va del primer '{' o '[' al último '}' o ']'."""
+    opciones = [(texto.find("{"), texto.rfind("}")), (texto.find("["), texto.rfind("]"))]
+    validos = [(a, b) for a, b in opciones if 0 <= a < b]
+    if not validos:
+        return texto
+    a, b = min(validos)
+    return texto[a:b + 1]
+
+
+def _json_tolerante(texto):
+    """Lee un JSON aunque tenga comas finales, claves sin comillas, comillas simples,
+    saltos de línea dentro de las cadenas o esté cortado a la mitad. Devuelve lo que haya."""
+    n = len(texto)
+    i = 0
+
+    def saltar():
+        nonlocal i
+        while i < n and texto[i] in " \t\r\n\ufeff\u00a0":
+            i += 1
+
+    def cadena():
+        nonlocal i
+        abre = texto[i]
+        cierra = _COMILLAS_JSON.get(abre, abre)
+        i += 1
+        trozos = []
+        while i < n:
+            c = texto[i]
+            if c == "\\" and i + 1 < n:
+                sig = texto[i + 1]
+                if sig in _ESCAPES_JSON:
+                    trozos.append(_ESCAPES_JSON[sig])
+                    i += 2
+                    continue
+                if sig == "u" and i + 5 < n:
+                    try:
+                        trozos.append(chr(int(texto[i + 2:i + 6], 16)))
+                        i += 6
+                        continue
+                    except ValueError:
+                        pass
+                trozos.append(sig)          # escape raro (\' o \x): se conserva el carácter
+                i += 2
+                continue
+            if c == cierra:
+                i += 1
+                return "".join(trozos)
+            if c in "\r\n":                 # salto de línea crudo dentro de la cadena
+                trozos.append(" ")
+                i += 1
+                continue
+            if c in "\t\v\f":
+                trozos.append(" ")
+                i += 1
+                continue
+            trozos.append(c)
+            i += 1
+        return "".join(trozos)              # cadena truncada por max_tokens
+
+    def objeto():
+        nonlocal i
+        i += 1
+        datos = {}
+        while True:
+            saltar()
+            if i >= n:
+                return datos
+            if texto[i] == "}":
+                i += 1
+                return datos
+            if texto[i] == ",":             # coma final o repetida
+                i += 1
+                continue
+            if texto[i] in _COMILLAS_JSON:
+                clave = cadena()
+            else:
+                m = re.match(r"[^:,\s\"'{}\[\]]+", texto[i:])
+                if not m:                   # basura suelta: se descarta
+                    i += 1
+                    continue
+                clave = m.group(0)
+                i += len(clave)
+            saltar()
+            if i < n and texto[i] == ":":
+                i += 1
+            else:                           # par sin dos puntos: se salta hasta el siguiente separador
+                while i < n and texto[i] not in ",}":
+                    i += 1
+                continue
+            try:
+                datos[clave.strip().strip("\"'")] = valor()
+            except ValueError:
+                return datos
+            saltar()
+
+    def lista():
+        nonlocal i
+        i += 1
+        datos = []
+        while True:
+            saltar()
+            if i >= n:
+                return datos
+            if texto[i] == "]":
+                i += 1
+                return datos
+            if texto[i] == ",":
+                i += 1
+                continue
+            try:
+                datos.append(valor())
+            except ValueError:
+                return datos
+            saltar()
+
+    def valor():
+        nonlocal i
+        saltar()
+        if i >= n:
+            raise ValueError("fin inesperado")
+        c = texto[i]
+        if c == "{":
+            return objeto()
+        if c == "[":
+            return lista()
+        if c in _COMILLAS_JSON:
+            return cadena()
+        for literal, dato in (("true", True), ("false", False), ("null", None),
+                              ("True", True), ("False", False), ("None", None), ("undefined", None)):
+            if texto.startswith(literal, i):
+                i += len(literal)
+                return dato
+        m = re.match(r"-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?", texto[i:])
+        if m:
+            i += len(m.group(0))
+            numero = m.group(0)
+            return float(numero) if ("." in numero or "e" in numero.lower()) else int(numero)
+        m = re.match(r"[^,}\]]+", texto[i:])   # texto sin comillas (NaN, una palabra...)
+        if not m:
+            raise ValueError(f"carácter inesperado {texto[i]!r}")
+        i += len(m.group(0))
+        return m.group(0).strip()
+
+    saltar()
+    return valor()
+
+
 def parsear_json(raw):
-    """Convierte la respuesta del modelo en JSON, quitando ``` si los puso o texto alrededor."""
-    raw = re.sub(r"^```(?:json)?", "", raw.strip())
-    raw = re.sub(r"```$", "", raw).strip()
+    """Convierte la respuesta del modelo en JSON.
+
+    Los modelos abiertos a veces devuelven ``` alrededor, una frase antes o después,
+    comas finales, claves sin comillas, comillas simples, saltos de línea dentro de las
+    cadenas o el JSON cortado por el tope de tokens. En vez de tumbar el pipeline, se
+    intenta leer de la forma más tolerante posible."""
+    texto = str(raw or "").strip()
+    texto = re.sub(r"^```(?:json)?", "", texto)
+    texto = re.sub(r"```$", "", texto).strip()
+    texto = texto.replace("\ufeff", "").replace("\u200b", "")
+    candidatos = [texto]
+    bloque = _bloque_json(texto)
+    if bloque != texto:
+        candidatos.append(bloque)
+
+    for candidato in candidatos:            # 1) JSON perfecto
+        try:
+            return json.loads(candidato)
+        except json.JSONDecodeError:
+            pass
+
+    for candidato in candidatos:            # 2) JSON "casi válido": se repara al vuelo
+        try:
+            dato = _json_tolerante(candidato)
+        except (ValueError, IndexError):
+            continue
+        if isinstance(dato, (dict, list)):
+            print(f"[JSON] Respuesta reparada ({len(candidato)} caracteres): el modelo no devolvió JSON "
+                  "estricto, pero se recuperó el contenido.", flush=True)
+            return dato
+
+    # 3) Nada funcionó: se dice exactamente dónde está el problema para que el
+    #    feedback del Jefe le pida al modelo corregirlo.
+    detalle = ""
     try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        # Los modelos abiertos a veces añaden una frase antes o después del JSON: nos quedamos con el bloque.
-        for ini, fin in (("{", "}"), ("[", "]")):
-            a, b = raw.find(ini), raw.rfind(fin)
-            if 0 <= a < b:
-                try:
-                    return json.loads(raw[a:b + 1])
-                except json.JSONDecodeError:
-                    pass
-        raise
+        json.loads(bloque)
+    except json.JSONDecodeError as e:
+        ini = max(0, e.pos - 70)
+        detalle = f" (columna {e.colno}: …{bloque[ini:e.pos + 70]}…)"
+    raise ValueError("La IA no devolvió un JSON válido" + detalle)
 
 
 def num_palabras(texto):
